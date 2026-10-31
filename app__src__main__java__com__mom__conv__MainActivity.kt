@@ -99,7 +99,7 @@ class MainActivity : Activity() {
             emptyList(),
             listOf(
                 FrameDropEffect.createDefaultFrameDropEffect(15f),
-                Presentation.createForWidthAndHeight(176, 144, Presentation.LAYOUT_SCALE_TO_FIT)
+                Presentation.createForWidthAndHeight(352, 288, Presentation.LAYOUT_SCALE_TO_FIT)
             )
         )
         val item = EditedMediaItem.Builder(MediaItem.fromUri(queue[idx])).setEffects(fx).build()
@@ -108,7 +108,7 @@ class MainActivity : Activity() {
             .setAudioMimeType(MimeTypes.AUDIO_AAC)
             .setEncoderFactory(
                 DefaultEncoderFactory.Builder(this)
-                    .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(300_000).build())
+                    .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(1_000_000).build())
                     .build()
             )
             .addListener(object : Transformer.Listener {
@@ -129,7 +129,7 @@ class MainActivity : Activity() {
         bar.progress = 100
         status.text = "3GP বানানো হচ্ছে ${idx + 1}/${queue.size}"
         val out = File(cacheDir, "o.3gp"); out.delete()
-        val v = "-y -i ${tmp!!.absolutePath} -c:v h263 -pix_fmt yuv420p -s 176x144 -r 15 -b:v 100k"
+        val v = "-y -i ${tmp!!.absolutePath} -vf scale=176:144:flags=lanczos,unsharp=3:3:0.7 -c:v h263 -pix_fmt yuv420p -r 15 -b:v 250k"
         val amr = "$v -c:a libopencore_amrnb -ar 8000 -ac 1 -b:a 12.2k ${out.absolutePath}"
         val aac = "$v -c:a aac -ar 16000 -ac 1 -b:a 24k ${out.absolutePath}"
         FFmpegKit.executeAsync(amr) { s1 ->
