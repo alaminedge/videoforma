@@ -31,6 +31,8 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegKitConfig
 import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class ConvService : Service() {
     companion object {
@@ -152,18 +154,18 @@ class ConvService : Service() {
         t.start(item, out.absolutePath)
     }
 
-    private fun run(cmd: String, done: (Boolean) -> Unit) {
+    private val segT = LongArray(8)
+
+    private fun run(cmd: String, k: Int, done: (Boolean) -> Unit) {
         FFmpegKit.executeAsync(cmd,
             { s -> done(ReturnCode.isSuccess(s.returnCode)) },
             null,
             { st ->
-                if (curDur > 0) progress = (st.time.toLong() * 100 / curDur).toInt().coerceIn(0, 100)
+                if (k >= 0) {
+                    segT[k] = st.time.toLong()
+                    if (curDur > 0) progress = (segT.sum() * 100 / curDur).toInt().coerceIn(0, 100)
+                }
             })
-    }
-
-    private fun tryRun(cmds: List<String>, i: Int, ok: () -> Unit, fail: () -> Unit) {
-        if (i >= cmds.size) { h.post(fail); return }
-        run(cmds[i]) { good -> if (good) h.post(ok) else tryRun(cmds, i + 1, ok, fail) }
     }
 
     private fun to3gp(input: String, onFail: () -> Unit) {
@@ -173,15 +175,47 @@ class ConvService : Service() {
             status = "ভিডিও ${idx + 1}/${uris.size} • ধাপ ২/২ (3GP বানানো হচ্ছে)"
         }
         val out = File(cacheDir, "o.3gp"); out.delete()
-        val vf = "scale=$ow:$oh:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos," +
+        val vars = ArrayList<Pair<Int, Boolean>>()
+        for (f in (if (fps == 15) listOf(15) else listOf(fps, 15))) { vars.add(Pair(f, true)); vars.add(Pair(f, false)) }
+        val n = if (curDur > 5 * 60_000L) Runtime.getRuntime().availableProcessors().coerceIn(1, 4) else 1
+        attempt(input, out, vars, 0, n, { save(out); next() }, onFail)
+    }
+
+    // n অংশে ভাগ করে একসাথে এনকোড, শেষে জোড়া লাগানো
+    private fun attempt(input: String, out: File, vars: List<Pair<Int, Boolean>>, vi: Int, n: Int,
+                        ok: () -> Unit, fail: () -> Unit) {
+        if (vi >= vars.size) { h.post(fail); return }
+        val (f, amr) = vars[vi]
+        segT.fill(0)
+        val vf = "scale=$ow:$oh:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=bicubic," +
                 "pad=$ow:$oh:(ow-iw)/2:(oh-ih)/2,unsharp=3:3:0.7"
-        val cmds = ArrayList<String>()
-        for (f in (if (fps == 15) listOf(15) else listOf(fps, 15))) {
-            val v = "-y -i $input -vf $vf -c:v h263 -pix_fmt yuv420p -r $f -b:v ${rate}k"
-            cmds.add("$v -c:a libopencore_amrnb -ar 8000 -ac 1 -b:a 12.2k ${out.absolutePath}")
-            cmds.add("$v -c:a aac -ar 16000 -ac 1 -b:a 24k ${out.absolutePath}")
+        val aud = if (amr) "-c:a libopencore_amrnb -ar 8000 -ac 1 -b:a 12.2k" else "-c:a aac -ar 16000 -ac 1 -b:a 24k"
+        val segLen = (curDur + n - 1) / n
+        val segs = List(n) { if (n == 1) out else File(cacheDir, "s$it.3gp") }
+        segs.forEach { it.delete() }
+        val left = AtomicInteger(n)
+        val good = AtomicBoolean(true)
+        val retry = { segs.forEach { it.delete() }; attempt(input, out, vars, vi + 1, n, ok, fail) }
+        for (k in 0 until n) {
+            val seek = if (n == 1) "" else "-ss ${k * segLen / 1000.0} -t ${segLen / 1000.0} "
+            val cmd = "-y ${seek}-i $input -vf $vf -c:v h263 -pix_fmt yuv420p -r $f -b:v ${rate}k $aud ${segs[k].absolutePath}"
+            run(cmd, k) { g ->
+                if (!g) good.set(false)
+                if (left.decrementAndGet() == 0) {
+                    if (!good.get()) retry()
+                    else if (n == 1) h.post(ok)
+                    else {
+                        val list = File(cacheDir, "l.txt")
+                        list.writeText(segs.joinToString("\n") { "file '${it.absolutePath}'" })
+                        out.delete()
+                        run("-y -f concat -safe 0 -i ${list.absolutePath} -c copy ${out.absolutePath}", -1) { g2 ->
+                            segs.forEach { it.delete() }
+                            if (g2) h.post(ok) else retry()
+                        }
+                    }
+                }
+            }
         }
-        tryRun(cmds, 0, { save(out); next() }, onFail)
     }
 
     private fun save(f: File) {
