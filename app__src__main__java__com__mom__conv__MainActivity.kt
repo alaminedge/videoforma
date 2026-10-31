@@ -1,14 +1,13 @@
 package com.mom.conv
 
 import android.app.Activity
-import android.content.ContentValues
 import android.content.Intent
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.view.View
 import android.view.WindowManager
@@ -20,30 +19,11 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.effect.FrameDropEffect
-import androidx.media3.effect.Presentation
-import androidx.media3.transformer.Composition
-import androidx.media3.transformer.DefaultEncoderFactory
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.Effects
-import androidx.media3.transformer.ExportException
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.ProgressHolder
-import androidx.media3.transformer.Transformer
-import androidx.media3.transformer.VideoEncoderSettings
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.ReturnCode
-import java.io.File
 
 class MainActivity : Activity() {
     private val queue = ArrayList<Uri>()
     private val durs = ArrayList<Long>()
-    private var idx = 0
-    private var curDur = 0L
-    private var transformer: Transformer? = null
-    private var tmp: File? = null
+    private val direct = ArrayList<Boolean>()
     private val h = Handler(Looper.getMainLooper())
     private lateinit var status: TextView
     private lateinit var info: TextView
@@ -52,38 +32,41 @@ class MainActivity : Activity() {
     private lateinit var convBtn: Button
     private lateinit var resSp: Spinner
     private lateinit var qSp: Spinner
+    private lateinit var fpsSp: Spinner
 
     private val sizes = arrayOf(intArrayOf(176, 144), intArrayOf(128, 96), intArrayOf(352, 288))
     private val rates = intArrayOf(150, 250, 400)
+    private val fpsList = intArrayOf(15, 12, 10)
 
-    private val poll = object : Runnable {
+    private val ui = object : Runnable {
         override fun run() {
-            val ph = ProgressHolder()
-            if (transformer?.getProgress(ph) == Transformer.PROGRESS_STATE_AVAILABLE) bar.progress = ph.progress
+            if (ConvService.status.isNotEmpty()) status.text = ConvService.status
+            bar.progress = ConvService.progress
+            convBtn.isEnabled = !ConvService.running && queue.isNotEmpty()
             h.postDelayed(this, 500)
         }
+    }
+
+    private fun spinner(items: List<String>, sel: Int = 0) = Spinner(this).apply {
+        adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items)
+        setSelection(sel)
     }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 2)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
         val pick = Button(this).apply { text = "ভিডিও বাছুন" }
         info = TextView(this).apply { text = "ভিডিও বাছা হয়নি"; textSize = 15f; setPadding(0, 24, 0, 24) }
-        resSp = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
-                listOf("রেজোলিউশন: 176x144 (মায়ের ফোন)", "রেজোলিউশন: 128x96 (ছোট)", "রেজোলিউশন: 352x288 (বড়)"))
-        }
-        qSp = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
-                listOf("কোয়ালিটি: ছোট সাইজ (150k)", "কোয়ালিটি: ভালো (250k)", "কোয়ালিটি: সেরা (400k)"))
-            setSelection(1)
-        }
+        resSp = spinner(listOf("রেজোলিউশন: 176x144 (মায়ের ফোন)", "রেজোলিউশন: 128x96 (ছোট)", "রেজোলিউশন: 352x288 (বড়)"))
+        qSp = spinner(listOf("কোয়ালিটি: ছোট সাইজ (150k)", "কোয়ালিটি: ভালো (250k)", "কোয়ালিটি: সেরা (400k)"), 1)
+        fpsSp = spinner(listOf("ফ্রেম রেট: 15 (স্বাভাবিক)", "ফ্রেম রেট: 12 (দ্রুত)", "ফ্রেম রেট: 10 (আরও দ্রুত)"))
         est = TextView(this).apply { textSize = 15f; setPadding(0, 16, 0, 16) }
         convBtn = Button(this).apply { text = "মায়ের ফোনের জন্য কনভার্ট"; isEnabled = false }
         status = TextView(this).apply { textSize = 18f; setPadding(0, 32, 0, 24) }
         bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
-        listOf(pick, info, resSp, qSp, est, convBtn, status, bar).forEach { root.addView(it) }
+        listOf(pick, info, resSp, qSp, fpsSp, est, convBtn, status, bar).forEach { root.addView(it) }
         setContentView(ScrollView(this).apply { addView(root) })
 
         val l = object : AdapterView.OnItemSelectedListener {
@@ -98,24 +81,37 @@ class MainActivity : Activity() {
                 type = "video/*"
                 addCategory(Intent.CATEGORY_OPENABLE)
                 putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
             }, 1)
         }
         convBtn.setOnClickListener {
             convBtn.isEnabled = false
-            idx = 0
-            h.removeCallbacks(poll); h.post(poll)
-            startNext()
+            val z = sizes[resSp.selectedItemPosition]
+            startForegroundService(Intent(this, ConvService::class.java).apply {
+                putExtra("uris", Array(queue.size) { queue[it].toString() })
+                putExtra("durs", durs.toLongArray())
+                putExtra("direct", direct.toBooleanArray())
+                putExtra("w", z[0])
+                putExtra("h", z[1])
+                putExtra("fps", fpsList[fpsSp.selectedItemPosition])
+                putExtra("rate", rates[qSp.selectedItemPosition])
+            })
+            status.text = "শুরু হচ্ছে... অ্যাপ বন্ধ করলেও কাজ চলবে"
         }
     }
+
+    override fun onResume() { super.onResume(); h.post(ui) }
+    override fun onPause() { h.removeCallbacks(ui); super.onPause() }
 
     override fun onActivityResult(req: Int, res: Int, d: Intent?) {
         super.onActivityResult(req, res, d)
         if (req != 1 || res != RESULT_OK || d == null) return
-        queue.clear(); durs.clear()
+        queue.clear(); durs.clear(); direct.clear()
         d.clipData?.let { c -> for (i in 0 until c.itemCount) queue.add(c.getItemAt(i).uri) }
             ?: d.data?.let { queue.add(it) }
         val sb = StringBuilder()
         queue.forEachIndexed { i, u ->
+            try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {}
             var w = 0; var hh = 0; var dur = 0L; var rot = 0
             try {
                 val r = MediaMetadataRetriever()
@@ -128,11 +124,13 @@ class MainActivity : Activity() {
             } catch (e: Exception) {}
             if (rot == 90 || rot == 270) { val t = w; w = hh; hh = t }
             durs.add(dur)
-            sb.append("${i + 1}) বর্তমান ${w}x$hh • ${fmt(dur)} • ${sizeMb(u)}MB\n")
+            val small = minOf(w, hh) in 1..360
+            direct.add(small)
+            sb.append("${i + 1}) বর্তমান ${w}x$hh • ${fmt(dur)} • ${sizeMb(u)}MB${if (small) " • দ্রুত পথ" else ""}\n")
         }
         info.text = sb.toString().trim()
         status.text = "${queue.size}টি ভিডিও বাছা হয়েছে"
-        convBtn.isEnabled = queue.isNotEmpty()
+        convBtn.isEnabled = queue.isNotEmpty() && !ConvService.running
         updateEst()
     }
 
@@ -152,95 +150,5 @@ class MainActivity : Activity() {
         val mb = sec * (rates[qSp.selectedItemPosition] + 12) * 1000 / 8 / 1048576
         val z = sizes[resSp.selectedItemPosition]
         est.text = if (sec > 0) "আউটপুট ${z[0]}x${z[1]} • আনুমানিক ${mb}MB" else ""
-    }
-
-    private fun startNext() {
-        if (idx >= queue.size) {
-            h.removeCallbacks(poll)
-            status.text = "শেষ! Movies/MomVideos ফোল্ডার দেখুন"
-            bar.progress = 100
-            convBtn.isEnabled = true
-            return
-        }
-        curDur = durs.getOrElse(idx) { 0L }
-        status.text = "ভিডিও ${idx + 1}/${queue.size} • ধাপ ১/২ (ছোট করা হচ্ছে)"
-        bar.progress = 0
-        val out = File(cacheDir, "o.mp4"); out.delete(); tmp = out
-        val fx = Effects(
-            emptyList(),
-            listOf(
-                FrameDropEffect.createDefaultFrameDropEffect(15f),
-                Presentation.createForWidthAndHeight(352, 288, Presentation.LAYOUT_SCALE_TO_FIT)
-            )
-        )
-        val item = EditedMediaItem.Builder(MediaItem.fromUri(queue[idx])).setEffects(fx).build()
-        val t = Transformer.Builder(this)
-            .setVideoMimeType(MimeTypes.VIDEO_H264)
-            .setAudioMimeType(MimeTypes.AUDIO_AAC)
-            .setEncoderFactory(
-                DefaultEncoderFactory.Builder(this)
-                    .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(1_000_000).build())
-                    .build()
-            )
-            .addListener(object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, exportResult: ExportResult) { to3gp() }
-                override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
-                    status.text = "ভুল: ${exportException.message}"; next()
-                }
-            }).build()
-        transformer = t
-        t.start(item, out.absolutePath)
-    }
-
-    private fun next() { idx++; startNext() }
-
-    private fun run(cmd: String, done: (Boolean) -> Unit) {
-        FFmpegKit.executeAsync(cmd,
-            { s -> done(ReturnCode.isSuccess(s.returnCode)) },
-            null,
-            { st ->
-                if (curDur > 0) {
-                    val p = (st.time.toLong() * 100 / curDur).toInt().coerceIn(0, 100)
-                    h.post { bar.progress = p }
-                }
-            })
-    }
-
-    private fun to3gp() {
-        bar.progress = 0
-        status.text = "ভিডিও ${idx + 1}/${queue.size} • ধাপ ২/২ (3GP বানানো হচ্ছে)"
-        val z = sizes[resSp.selectedItemPosition]
-        val r = rates[qSp.selectedItemPosition]
-        val out = File(cacheDir, "o.3gp"); out.delete()
-        val v = "-y -i ${tmp!!.absolutePath} -vf scale=${z[0]}:${z[1]}:flags=lanczos,unsharp=3:3:0.7 " +
-                "-c:v h263 -pix_fmt yuv420p -r 15 -b:v ${r}k"
-        val amr = "$v -c:a libopencore_amrnb -ar 8000 -ac 1 -b:a 12.2k ${out.absolutePath}"
-        val aac = "$v -c:a aac -ar 16000 -ac 1 -b:a 24k ${out.absolutePath}"
-        run(amr) { ok1 ->
-            if (ok1) {
-                h.post { save(out); next() }
-            } else {
-                run(aac) { ok2 ->
-                    h.post {
-                        if (ok2) save(out) else status.text = "3GP ভুল, পরেরটা দেখছি"
-                        next()
-                    }
-                }
-            }
-        }
-    }
-
-    private fun save(f: File) {
-        val sp = getSharedPreferences("m", 0)
-        val n = sp.getInt("n", 0) + 1
-        sp.edit().putInt("n", n).apply()
-        val v = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, "video$n.3gp")
-            put(MediaStore.Video.Media.MIME_TYPE, "video/3gpp")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MomVideos")
-        }
-        val u = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v) ?: return
-        contentResolver.openOutputStream(u)?.use { o -> f.inputStream().use { it.copyTo(o) } }
-        f.delete(); tmp?.delete()
     }
 }
