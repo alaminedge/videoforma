@@ -26,6 +26,8 @@ import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
+import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
 
 class MainActivity : Activity() {
@@ -106,12 +108,12 @@ class MainActivity : Activity() {
             .setAudioMimeType(MimeTypes.AUDIO_AAC)
             .setEncoderFactory(
                 DefaultEncoderFactory.Builder(this)
-                    .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(128_000).build())
+                    .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(300_000).build())
                     .build()
             )
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    save(); idx++; startNext()
+                    to3gp()
                 }
                 override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
                     status.text = "ভুল: ${exportException.message}"; idx++; startNext()
@@ -121,17 +123,40 @@ class MainActivity : Activity() {
         t.start(item, out.absolutePath)
     }
 
-    private fun save() {
+    private fun next() { idx++; startNext() }
+
+    private fun to3gp() {
+        bar.progress = 100
+        status.text = "3GP বানানো হচ্ছে ${idx + 1}/${queue.size}"
+        val out = File(cacheDir, "o.3gp"); out.delete()
+        val v = "-y -i ${tmp!!.absolutePath} -c:v h263 -pix_fmt yuv420p -s 176x144 -r 15 -b:v 100k"
+        val amr = "$v -c:a libopencore_amrnb -ar 8000 -ac 1 -b:a 12.2k ${out.absolutePath}"
+        val aac = "$v -c:a aac -ar 16000 -ac 1 -b:a 24k ${out.absolutePath}"
+        FFmpegKit.executeAsync(amr) { s1 ->
+            if (ReturnCode.isSuccess(s1.returnCode)) {
+                h.post { save(out); next() }
+            } else {
+                FFmpegKit.executeAsync(aac) { s2 ->
+                    h.post {
+                        if (ReturnCode.isSuccess(s2.returnCode)) save(out) else status.text = "3GP ভুল, পরেরটা দেখছি"
+                        next()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun save(f: File) {
         val sp = getSharedPreferences("m", 0)
         val n = sp.getInt("n", 0) + 1
         sp.edit().putInt("n", n).apply()
         val v = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, "video$n.mp4")
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.DISPLAY_NAME, "video$n.3gp")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/3gpp")
             put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MomVideos")
         }
         val u = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v) ?: return
-        contentResolver.openOutputStream(u)?.use { o -> tmp!!.inputStream().use { it.copyTo(o) } }
-        tmp!!.delete()
+        contentResolver.openOutputStream(u)?.use { o -> f.inputStream().use { it.copyTo(o) } }
+        f.delete(); tmp?.delete()
     }
 }
